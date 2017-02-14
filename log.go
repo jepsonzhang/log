@@ -6,8 +6,8 @@ import (
 	"io"
 	"log"
 	"os"
-	"runtime"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -50,11 +50,19 @@ var _log *logger = New()
 
 func init() {
 	SetFlags(Ldate | Ltime | Lshortfile)
-	SetHighlighting(runtime.GOOS != "windows")
 }
 
 func Logger() *log.Logger {
 	return _log._log
+}
+
+func CrashLog(file string) {
+	f, err := os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Println(err.Error())
+	} else {
+		syscall.Dup2(int(f.Fd()), 2)
+	}
 }
 
 func SetLevel(level LogLevel) {
@@ -140,6 +148,10 @@ func SetRotateByHour() {
 	_log.SetRotateByHour()
 }
 
+func Rotate() {
+	go _log.rotate()
+}
+
 type logger struct {
 	_log         *log.Logger
 	level        LogLevel
@@ -151,8 +163,7 @@ type logger struct {
 	fileName  string
 	logSuffix string
 	fd        *os.File
-
-	lock sync.Mutex
+	lock      sync.RWMutex
 }
 
 func (l *logger) SetHighlighting(highlighting bool) {
@@ -177,39 +188,50 @@ func (l *logger) SetRotateByHour() {
 	l.logSuffix = genHourTime(time.Now())
 }
 
-func (l *logger) rotate() error {
-	l.lock.Lock()
-	defer l.lock.Unlock()
-
-	var suffix string
-	if l.dailyRolling {
-		suffix = genDayTime(time.Now())
-	} else if l.hourRolling {
-		suffix = genHourTime(time.Now())
-	} else {
-		return nil
-	}
-
-	// Notice: if suffix is not equal to l.LogSuffix, then rotate
-	if suffix != l.logSuffix {
-		err := l.doRotate(suffix)
-		if err != nil {
-			return err
+func (l *logger) rotate() {
+	//这里单独开个协程，用来处理压缩的事
+	for {
+		var t *time.Timer
+		if l.dailyRolling {
+			now := time.Now()
+			next := now.Add(time.Hour * 24)
+			next = time.Date(next.Year(), next.Month(), next.Day(), 0, 0, 0, 0, next.Location())
+			t = time.NewTimer(next.Sub(now))
+		} else if l.hourRolling {
+			now := time.Now()
+			next := now.Add(time.Hour * 1)
+			next = time.Date(next.Year(), next.Month(), next.Day(), next.Hour(), 0, 0, 0, next.Location())
+			t = time.NewTimer(next.Sub(now))
+		} else {
+			return
 		}
+		<-t.C
+		l.lock.Lock()
+		var suffix string
+		if l.dailyRolling {
+			suffix = genDayTime(time.Now())
+		} else if l.hourRolling {
+			suffix = genHourTime(time.Now())
+		}
+		if suffix != l.logSuffix {
+			err := l.doRotate(suffix)
+			if err != nil {
+				l.Errorf(" log err: %s\n", err)
+			}
+		}
+		l.lock.Unlock()
 	}
-
-	return nil
 }
 
 func (l *logger) doRotate(suffix string) error {
-	// Notice: Not check error, is this ok?
-	l.fd.Close()
-
 	lastFileName := l.fileName + "." + l.logSuffix
 	err := os.Rename(l.fileName, lastFileName)
 	if err != nil {
 		return err
 	}
+
+	// Notice: Not check error, is this ok?
+	l.fd.Close()
 
 	err = l.SetOutputByName(l.fileName)
 	if err != nil {
@@ -244,12 +266,8 @@ func (l *logger) log(t LogType, v ...interface{}) {
 		return
 	}
 
-	err := l.rotate()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s\n", err.Error())
-		return
-	}
-
+	l.lock.RLock()
+	defer l.lock.RUnlock()
 	v1 := make([]interface{}, len(v)+2)
 	logStr, logColor := LogTypeToString(t)
 	if l.highlighting {
@@ -271,11 +289,8 @@ func (l *logger) logf(t LogType, format string, v ...interface{}) {
 		return
 	}
 
-	err := l.rotate()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s\n", err.Error())
-		return
-	}
+	l.lock.RLock()
+	defer l.lock.RUnlock()
 
 	logStr, logColor := LogTypeToString(t)
 	var s string
@@ -372,7 +387,7 @@ func genHourTime(t time.Time) string {
 }
 
 func New() *logger {
-	return Newlogger(os.Stderr, "")
+	return Newlogger(os.Stdout, "")
 }
 
 func Newlogger(w io.Writer, prefix string) *logger {
